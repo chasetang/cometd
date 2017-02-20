@@ -18,9 +18,11 @@ package org.cometd.bayeux.server;
 import java.util.List;
 import java.util.Queue;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 
 import org.cometd.bayeux.Bayeux;
 import org.cometd.bayeux.Message;
+import org.cometd.bayeux.Promise;
 import org.cometd.bayeux.Session;
 
 /**
@@ -92,9 +94,10 @@ public interface ServerSession extends Session {
      *
      * @param sender  the session delivering the message
      * @param message the message to deliver
+     * @return a future that tells whether the message has been delivered
      * @see #deliver(Session, String, Object)
      */
-    public void deliver(Session sender, ServerMessage.Mutable message);
+    public CompletableFuture<Boolean> deliver(Session sender, ServerMessage.Mutable message);
 
     /**
      * <p>Delivers the given information to this session.</p>
@@ -102,9 +105,10 @@ public interface ServerSession extends Session {
      * @param sender  the session delivering the message
      * @param channel the channel of the message
      * @param data    the data of the message
+     * @return a future that tells whether the message has been delivered
      * @see #deliver(Session, ServerMessage.Mutable)
      */
-    public void deliver(Session sender, String channel, Object data);
+    public CompletableFuture<Boolean> deliver(Session sender, String channel, Object data);
 
     /**
      * @return the set of channels to which this session is subscribed to
@@ -167,6 +171,10 @@ public interface ServerSession extends Session {
      * <p>Listeners objects that implement this interface will be notified of message sending.</p>
      */
     public interface MessageListener extends ServerSessionListener {
+        public default void onMessage(ServerSession session, ServerSession sender, ServerMessage message, Promise<Boolean> promise) {
+            promise.succeed(onMessage(session, sender, message));
+        }
+
         /**
          * <p>Callback invoked when a message is sent.</p>
          * <p>Implementers can decide to return false to signal that the message should not
@@ -178,7 +186,9 @@ public interface ServerSession extends Session {
          * @param message the message sent
          * @return whether the processing of the message should continue
          */
-        public boolean onMessage(ServerSession session, ServerSession sender, ServerMessage message);
+        public default boolean onMessage(ServerSession session, ServerSession sender, ServerMessage message) {
+            return true;
+        }
     }
 
     /**
@@ -247,6 +257,10 @@ public interface ServerSession extends Session {
      * @see BayeuxServer.Extension
      */
     public interface Extension {
+        default void incoming(ServerSession session, ServerMessage.Mutable message, Promise<Boolean> promise) {
+            promise.succeed(message.isMeta() ? rcvMeta(session, message) : rcv(session, message));
+        }
+
         /**
          * <p>Callback method invoked every time a normal message is incoming.</p>
          *
@@ -254,7 +268,9 @@ public interface ServerSession extends Session {
          * @param message the incoming message
          * @return true if message processing should continue, false if it should stop
          */
-        public boolean rcv(ServerSession session, ServerMessage.Mutable message);
+        default boolean rcv(ServerSession session, ServerMessage.Mutable message) {
+            return true;
+        }
 
         /**
          * <p>Callback method invoked every time a meta message is incoming.</p>
@@ -263,7 +279,24 @@ public interface ServerSession extends Session {
          * @param message the incoming meta message
          * @return true if message processing should continue, false if it should stop
          */
-        public boolean rcvMeta(ServerSession session, ServerMessage.Mutable message);
+        default boolean rcvMeta(ServerSession session, ServerMessage.Mutable message) {
+            return true;
+        }
+
+        default void outgoing(ServerSession session, ServerMessage.Mutable message, Promise<ServerMessage.Mutable> promise) {
+            if (message.isMeta()) {
+                promise.succeed(sendMeta(session, message) ? message : null);
+            } else {
+                ServerMessage result = send(session, message);
+                if (result instanceof ServerMessage.Mutable) {
+                    promise.succeed((ServerMessage.Mutable)result);
+                } else if (result == null) {
+                    promise.succeed(null);
+                } else {
+                    promise.fail(new IllegalArgumentException());
+                }
+            }
+        }
 
         /**
          * <p>Callback method invoked every time a normal message is outgoing.</p>
@@ -272,7 +305,9 @@ public interface ServerSession extends Session {
          * @param message the outgoing message
          * @return The message to send or null to not send the message
          */
-        public ServerMessage send(ServerSession session, ServerMessage message);
+        default ServerMessage send(ServerSession session, ServerMessage message) {
+            return message;
+        }
 
         /**
          * <p>Callback method invoked every time a meta message is outgoing.</p>
@@ -281,27 +316,16 @@ public interface ServerSession extends Session {
          * @param message the outgoing meta message
          * @return true if message processing should continue, false if it should stop
          */
-        public boolean sendMeta(ServerSession session, ServerMessage.Mutable message);
+        default boolean sendMeta(ServerSession session, ServerMessage.Mutable message) {
+            return true;
+        }
 
         /**
          * Empty implementation of {@link Extension}.
+         * @deprecated
          */
+        @Deprecated
         public static class Adapter implements Extension {
-            public boolean rcv(ServerSession session, ServerMessage.Mutable message) {
-                return true;
-            }
-
-            public boolean rcvMeta(ServerSession session, ServerMessage.Mutable message) {
-                return true;
-            }
-
-            public ServerMessage send(ServerSession session, ServerMessage message) {
-                return message;
-            }
-
-            public boolean sendMeta(ServerSession session, ServerMessage.Mutable message) {
-                return true;
-            }
         }
     }
 }

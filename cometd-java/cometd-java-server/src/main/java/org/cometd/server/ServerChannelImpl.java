@@ -20,6 +20,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.CountDownLatch;
@@ -275,29 +276,35 @@ public class ServerChannelImpl implements ServerChannel, Dumpable {
         return _id.isService();
     }
 
-    public void publish(Session from, ServerMessage.Mutable mutable) {
+    public CompletableFuture<Boolean> publish(Session from, ServerMessage.Mutable mutable) {
         if (isWild()) {
             throw new IllegalStateException("Wild publish");
         }
 
         mutable.setChannel(getId());
 
-        ServerSessionImpl session = null;
+        ServerSessionImpl serverSession = null;
         if (from instanceof ServerSessionImpl) {
-            session = (ServerSessionImpl)from;
+            serverSession = (ServerSessionImpl)from;
         } else if (from instanceof LocalSession) {
-            session = (ServerSessionImpl)((LocalSession)from).getServerSession();
+            serverSession = (ServerSessionImpl)((LocalSession)from).getServerSession();
         }
+        ServerSessionImpl session = serverSession;
 
-        if (_bayeux.extendSend(session, null, mutable)) {
-            _bayeux.doPublish(session, this, mutable, false);
-        }
+        return _bayeux.extendOutgoing(session, null, mutable)
+                .thenCompose(b -> {
+                    if (b) {
+                        return _bayeux.doPublish(session, this, mutable, false);
+                    } else {
+                        return CompletableFuture.completedFuture(false);
+                    }
+                });
     }
 
-    public void publish(Session from, Object data) {
+    public CompletableFuture<Boolean> publish(Session from, Object data) {
         ServerMessage.Mutable mutable = _bayeux.newMessage();
         mutable.setData(data);
-        publish(from, mutable);
+        return publish(from, mutable);
     }
 
     protected void sweep() {

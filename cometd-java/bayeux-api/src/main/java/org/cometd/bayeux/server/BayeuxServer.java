@@ -19,6 +19,7 @@ import java.util.List;
 
 import org.cometd.bayeux.Bayeux;
 import org.cometd.bayeux.MarkedReference;
+import org.cometd.bayeux.Promise;
 import org.cometd.bayeux.Transport;
 import org.cometd.bayeux.client.ClientSession;
 import org.cometd.bayeux.client.ClientSessionChannel;
@@ -278,6 +279,9 @@ public interface BayeuxServer extends Bayeux {
      * @see BayeuxServer#addExtension(Extension)
      */
     public interface Extension {
+        default void incoming(ServerSession from, ServerMessage.Mutable message, Promise<Boolean> promise) {
+            promise.succeed(message.isMeta() ? rcvMeta(from, message) : rcv(from, message));
+        }
         /**
          * <p>Callback method invoked every time a normal message is incoming.</p>
          *
@@ -285,7 +289,9 @@ public interface BayeuxServer extends Bayeux {
          * @param message the incoming message
          * @return true if message processing should continue, false if it should stop
          */
-        boolean rcv(ServerSession from, ServerMessage.Mutable message);
+        default boolean rcv(ServerSession from, ServerMessage.Mutable message) {
+            return true;
+        }
 
         /**
          * <p>Callback method invoked every time a meta message is incoming.</p>
@@ -294,7 +300,13 @@ public interface BayeuxServer extends Bayeux {
          * @param message the incoming meta message
          * @return true if message processing should continue, false if it should stop
          */
-        boolean rcvMeta(ServerSession from, ServerMessage.Mutable message);
+        default boolean rcvMeta(ServerSession from, ServerMessage.Mutable message) {
+            return true;
+        }
+
+        default void outgoing(ServerSession from, ServerSession to, ServerMessage.Mutable message, Promise<Boolean> promise) {
+            promise.succeed(message.isMeta() ? sendMeta(to, message) : send(from, to, message));
+        }
 
         /**
          * <p>Callback method invoked every time a normal message is outgoing.</p>
@@ -304,7 +316,9 @@ public interface BayeuxServer extends Bayeux {
          * @param message the outgoing message
          * @return true if message processing should continue, false if it should stop
          */
-        boolean send(ServerSession from, ServerSession to, ServerMessage.Mutable message);
+        default boolean send(ServerSession from, ServerSession to, ServerMessage.Mutable message) {
+            return true;
+        }
 
         /**
          * <p>Callback method invoked every time a meta message is outgoing.</p>
@@ -313,27 +327,16 @@ public interface BayeuxServer extends Bayeux {
          * @param message the outgoing meta message
          * @return true if message processing should continue, false if it should stop
          */
-        boolean sendMeta(ServerSession to, ServerMessage.Mutable message);
+        default boolean sendMeta(ServerSession to, ServerMessage.Mutable message) {
+            return true;
+        }
 
         /**
          * Empty implementation of {@link Extension}.
+         * @deprecated Use {@link Extension} instead
          */
+        @Deprecated
         public static class Adapter implements Extension {
-            public boolean rcv(ServerSession from, ServerMessage.Mutable message) {
-                return true;
-            }
-
-            public boolean rcvMeta(ServerSession from, ServerMessage.Mutable message) {
-                return true;
-            }
-
-            public boolean send(ServerSession from, ServerSession to, ServerMessage.Mutable message) {
-                return true;
-            }
-
-            public boolean sendMeta(ServerSession to, ServerMessage.Mutable message) {
-                return true;
-            }
         }
     }
 }

@@ -16,7 +16,9 @@
 package org.cometd.bayeux.server;
 
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 
+import org.cometd.bayeux.Promise;
 import org.cometd.bayeux.Session;
 import org.cometd.bayeux.client.ClientSessionChannel;
 
@@ -69,18 +71,20 @@ public interface ServerChannel extends ConfigurableServerChannel {
      *
      * @param from    the session from which the message originates
      * @param message the message to publish
+     * @return a future that tells whether the message has been published
      * @see #publish(Session, Object)
      */
-    public void publish(Session from, ServerMessage.Mutable message);
+    public CompletableFuture<Boolean> publish(Session from, ServerMessage.Mutable message);
 
     /**
      * <p>Publishes the given information to this channel.</p>
      *
      * @param from the session from which the message originates
      * @param data the data of the message
+     * @return a future that tells whether the message has been published
      * @see #publish(Session, ServerMessage.Mutable)
      */
-    public void publish(Session from, Object data);
+    public CompletableFuture<Boolean> publish(Session from, Object data);
 
     /**
      * <p>Removes this channel, and all the children channels.</p>
@@ -96,6 +100,10 @@ public interface ServerChannel extends ConfigurableServerChannel {
      * <p>Listeners objects that implement this interface will be notified of message publish.</p>
      */
     public interface MessageListener extends ServerChannelListener {
+        public default void onMessage(ServerSession from, ServerChannel channel, ServerMessage.Mutable message, Promise<Boolean> promise) {
+            promise.succeed(onMessage(from, channel, message));
+        }
+
         /**
          * <p>Callback invoked when a message is being published.</p>
          * <p>Implementers can decide to return false to signal that the message should not be
@@ -106,7 +114,9 @@ public interface ServerChannel extends ConfigurableServerChannel {
          * @param message the message to be published
          * @return whether the message should be published or not
          */
-        public boolean onMessage(ServerSession from, ServerChannel channel, ServerMessage.Mutable message);
+        public default boolean onMessage(ServerSession from, ServerChannel channel, ServerMessage.Mutable message) {
+            return true;
+        }
     }
 
     /**

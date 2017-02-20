@@ -15,6 +15,7 @@
  */
 package org.cometd.bayeux.server;
 
+import org.cometd.bayeux.Promise;
 import org.cometd.bayeux.Session;
 import org.cometd.bayeux.client.ClientSessionChannel;
 
@@ -34,6 +35,9 @@ import org.cometd.bayeux.client.ClientSessionChannel;
  * @see ServerChannel#addAuthorizer(Authorizer)
  */
 public interface SecurityPolicy {
+    default void canHandshake(BayeuxServer server, ServerSession session, ServerMessage message, Promise<Boolean> promise) {
+        promise.succeed(canHandshake(server, session, message));
+    }
     /**
      * <p>Checks if a handshake message should be accepted.</p>
      * <p>Both remote sessions and local sessions are subject to this check.
@@ -47,8 +51,13 @@ public interface SecurityPolicy {
      * @return true if the handshake message should be accepted and the {@link ServerSession} instance
      * associated to the {@link BayeuxServer} object
      */
-    boolean canHandshake(BayeuxServer server, ServerSession session, ServerMessage message);
+    default boolean canHandshake(BayeuxServer server, ServerSession session, ServerMessage message) {
+        return false;
+    }
 
+    default void canCreate(BayeuxServer server, ServerSession session, String channelId, ServerMessage message, Promise<Boolean> promise) {
+        promise.succeed(canCreate(server, session, channelId, message));
+    }
     /**
      * <p>Checks if a message should be allowed to create a new channel.</p>
      * <p>A subscribe message or publish message to a channel not yet known to the server triggers this check.
@@ -64,7 +73,13 @@ public interface SecurityPolicy {
      * @param message   the message trying to create the channel
      * @return true if the channel should be created
      */
-    boolean canCreate(BayeuxServer server, ServerSession session, String channelId, ServerMessage message);
+    default boolean canCreate(BayeuxServer server, ServerSession session, String channelId, ServerMessage message) {
+        return false;
+    }
+
+    default void canSubscribe(BayeuxServer server, ServerSession session, ServerChannel channel, ServerMessage message, Promise<Boolean> promise) {
+        promise.succeed(canSubscribe(server, session, channel, message));
+    }
 
     /**
      * <p>Checks if a subscribe message from a client is allowed to subscribe to a channel.</p>
@@ -78,7 +93,13 @@ public interface SecurityPolicy {
      * @param message the subscribe message
      * @return true if the client can subscribe to the channel
      */
-    boolean canSubscribe(BayeuxServer server, ServerSession session, ServerChannel channel, ServerMessage message);
+    default boolean canSubscribe(BayeuxServer server, ServerSession session, ServerChannel channel, ServerMessage message) {
+        return false;
+    }
+
+    default void canPublish(BayeuxServer server, ServerSession session, ServerChannel channel, ServerMessage message, Promise<Boolean> promise) {
+        promise.succeed(canPublish(server, session, channel, message));
+    }
 
     /**
      * <p>Checks if a client can publish a message to a channel.</p>
@@ -92,5 +113,7 @@ public interface SecurityPolicy {
      * @param message the message to being published
      * @return true if the client can publish to the channel
      */
-    boolean canPublish(BayeuxServer server, ServerSession session, ServerChannel channel, ServerMessage message);
+    default boolean canPublish(BayeuxServer server, ServerSession session, ServerChannel channel, ServerMessage message) {
+        return false;
+    }
 }

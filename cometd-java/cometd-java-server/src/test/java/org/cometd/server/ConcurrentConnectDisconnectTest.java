@@ -16,6 +16,7 @@
 package org.cometd.server;
 
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -147,15 +148,17 @@ public class ConcurrentConnectDisconnectTest extends AbstractBayeuxClientServerT
         final CountDownLatch suspendLatch = new CountDownLatch(1);
         JSONTransport transport = new JSONTransport(bayeux) {
             @Override
-            protected ServerMessage.Mutable bayeuxServerHandle(ServerSessionImpl session, ServerMessage.Mutable message) {
-                ServerMessage.Mutable reply = super.bayeuxServerHandle(session, message);
-                if (Channel.META_CONNECT.equals(message.getChannel())) {
-                    connectLatch.countDown();
-                    if (connectLatch.getCount() == 0) {
-                        await(disconnectLatch);
-                    }
-                }
-                return reply;
+            protected CompletableFuture<ServerMessage.Mutable> bayeuxServerHandle(ServerSessionImpl session, ServerMessage.Mutable message) {
+                return super.bayeuxServerHandle(session, message)
+                        .thenApply(reply -> {
+                            if (Channel.META_CONNECT.equals(message.getChannel())) {
+                                connectLatch.countDown();
+                                if (connectLatch.getCount() == 0) {
+                                    await(disconnectLatch);
+                                }
+                            }
+                            return reply;
+                        });
             }
 
             @Override

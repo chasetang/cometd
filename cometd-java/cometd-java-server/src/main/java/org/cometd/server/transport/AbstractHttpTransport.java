@@ -18,6 +18,7 @@ package org.cometd.server.transport;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.security.Principal;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
@@ -25,11 +26,13 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Stream;
 
 import javax.servlet.AsyncContext;
 import javax.servlet.AsyncEvent;
@@ -132,94 +135,101 @@ public abstract class AbstractHttpTransport extends AbstractServerTransport {
 
     protected abstract void write(HttpServletRequest request, HttpServletResponse response, ServerSessionImpl session, boolean scheduleExpiration, List<ServerMessage> messages, ServerMessage.Mutable[] replies);
 
-    protected void processMessages(HttpServletRequest request, HttpServletResponse response, ServerMessage.Mutable[] messages) throws IOException {
-        Collection<ServerSessionImpl> sessions = findCurrentSessions(request);
-        ServerSessionImpl session = null;
-        boolean autoBatch = isAutoBatch();
-        boolean batch = false;
-        boolean sendQueue = true;
-        boolean sendReplies = true;
-        boolean scheduleExpiration = true;
-        try {
-            for (int i = 0; i < messages.length; ++i) {
-                ServerMessage.Mutable message = messages[i];
-                if (_logger.isDebugEnabled()) {
-                    _logger.debug("Processing {}", message);
-                }
-
-                // Try to find the session.
-                String clientId = message.getClientId();
-                if (sessions != null) {
-                    if (clientId != null) {
-                        for (ServerSessionImpl s : sessions) {
-                            if (s.getId().equals(clientId)) {
-                                session = s;
-                                break;
-                            }
-                        }
+    protected CompletableFuture<Void> processMessages(HttpServletRequest request, HttpServletResponse response, ServerMessage.Mutable[] messages) throws IOException {
+        Context context = new Context();
+        context.request = request;
+        context.response = response;
+        context.messages = messages;
+        context.sessions = findCurrentSessions(request);
+        context.replies = new ArrayList<>(messages.length);
+        return Stream.of(messages).reduce(CompletableFuture.<Void>completedFuture(null),
+                (cf, message) -> cf.thenCompose(y -> processMessage(context, message)),
+                (cf1, cf2) -> cf1.thenCombine(cf2, (y1, y2) -> null))
+                .thenAccept(y -> {
+                    if (context.sendQueue || context.sendReplies) {
+                        flush(request, response, context.session, context.sendQueue, context.scheduleExpiration, context.replies.toArray(new ServerMessage.Mutable[0]));
                     }
-                }
-
-                if (session == null && _trustClientSession) {
-                    session = (ServerSessionImpl)getBayeux().getSession(clientId);
-                }
-
-                if (session != null) {
-                    if (session.isHandshook()) {
-                        if (autoBatch && !batch) {
-                            batch = true;
-                            session.startBatch();
-                        }
-                    } else {
-                        // Disconnected concurrently.
-                        if (batch) {
-                            batch = false;
-                            session.endBatch();
-                        }
-                        session = null;
+                })
+                .whenComplete((r, x) -> {
+                    if (context.batch) {
+                        context.session.endBatch();
                     }
-                }
+                });
+    }
 
-                switch (message.getChannel()) {
-                    case Channel.META_HANDSHAKE: {
-                        if (messages.length > 1) {
-                            throw new IOException();
-                        }
-                        ServerMessage.Mutable reply = processMetaHandshake(request, response, session, message);
-                        if (reply != null) {
-                            session = (ServerSessionImpl)getBayeux().getSession(reply.getClientId());
-                        }
-                        messages[i] = processReply(session, reply);
-                        sendQueue = allowMessageDeliveryDuringHandshake(session) && reply != null && reply.isSuccessful();
-                        sendReplies = reply != null;
-                        break;
-                    }
-                    case Channel.META_CONNECT: {
-                        ServerMessage.Mutable reply = processMetaConnect(request, response, session, message);
-                        messages[i] = processReply(session, reply);
-                        sendQueue = sendReplies = reply != null;
-                        break;
-                    }
-                    default: {
-                        ServerMessage.Mutable reply = bayeuxServerHandle(session, message);
-                        messages[i] = processReply(session, reply);
-                        if (isMetaConnectDeliveryOnly() || session != null && session.isMetaConnectDeliveryOnly()) {
-                            sendQueue = false;
-                        }
-                        scheduleExpiration = false;
-                        break;
-                    }
-                }
-            }
+    private CompletableFuture<Void> processMessage(Context context, ServerMessage.Mutable message) {
+        if (_logger.isDebugEnabled()) {
+            _logger.debug("Processing {}", message);
+        }
+        // TODO: enforce one session only for all messages
+        ServerSessionImpl session = context.session = findSession(context.sessions, message.getClientId());
 
-            if (sendQueue || sendReplies) {
-                flush(request, response, session, sendQueue, scheduleExpiration, messages);
-            }
-        } finally {
-            if (batch) {
-                session.endBatch();
+        if (session != null) {
+            if (session.isHandshook()) {
+                if (isAutoBatch() && !context.batch) {
+                    context.batch = true;
+                    session.startBatch();
+                }
             }
         }
+
+        switch (message.getChannel()) {
+            case Channel.META_HANDSHAKE: {
+                if (context.messages.length > 1) {
+                    CompletableFuture<Void> cf = new CompletableFuture<>();
+                    cf.completeExceptionally(new IOException());
+                    return cf;
+                } else {
+                    return processMetaHandshake(context.request, context.response, session, message)
+                            .thenCompose(reply -> {
+                                context.session = (ServerSessionImpl)getBayeux().getSession(reply.getClientId());
+                                return processReply(context.session, reply);
+                            }).thenAccept(reply -> {
+                                context.replies.add(reply);
+                                context.sendQueue = reply != null && reply.isSuccessful() && allowMessageDeliveryDuringHandshake(session);
+                                context.sendReplies = reply != null;
+                                context.scheduleExpiration = true;
+                            });
+                }
+            }
+            case Channel.META_CONNECT: {
+                return processMetaConnect(context.request, context.response, session, message)
+                        .thenCompose(reply -> processReply(session, reply))
+                        .thenAccept(reply -> {
+                            context.replies.add(reply);
+                            context.sendQueue = reply != null;
+                            context.sendReplies = reply != null;
+                            context.scheduleExpiration = true;
+                        });
+            }
+            default: {
+                return bayeuxServerHandle(session, message)
+                        .thenCompose(reply -> processReply(session, reply))
+                        .thenAccept(reply -> {
+                            context.replies.add(reply);
+                            context.sendQueue = true;
+                            if (isMetaConnectDeliveryOnly() || session != null && session.isMetaConnectDeliveryOnly()) {
+                                context.sendQueue = false;
+                            }
+                            context.sendReplies = true;
+                            context.scheduleExpiration = false;
+                        });
+
+            }
+        }
+    }
+
+    private ServerSessionImpl findSession(Collection<ServerSessionImpl> sessions, String clientId) {
+        if (sessions != null) {
+            if (clientId != null) {
+                for (ServerSessionImpl session : sessions) {
+                    if (session.getId().equals(clientId)) {
+                        return session;
+                    }
+                }
+            }
+        }
+        return _trustClientSession ? (ServerSessionImpl)getBayeux().getSession(clientId) : null;
     }
 
     protected Collection<ServerSessionImpl> findCurrentSessions(HttpServletRequest request) {
@@ -236,46 +246,39 @@ public abstract class AbstractHttpTransport extends AbstractServerTransport {
         return null;
     }
 
-    protected ServerMessage.Mutable processMetaHandshake(HttpServletRequest request, HttpServletResponse response, ServerSessionImpl session, ServerMessage.Mutable message) {
-        ServerMessage.Mutable reply = bayeuxServerHandle(session, message);
-        if (reply != null) {
-            session = (ServerSessionImpl)getBayeux().getSession(reply.getClientId());
-            if (session != null) {
-                String id = findBrowserId(request);
-                if (id == null) {
-                    id = setBrowserId(request, response);
-                }
-                final String browserId = id;
-                session.setBrowserId(browserId);
-                synchronized (_sessions) {
-                    Collection<ServerSessionImpl> sessions = _sessions.get(browserId);
-                    if (sessions == null) {
-                        // The list is modified inside sync blocks, but
-                        // iterated outside, so it must be concurrent.
-                        sessions = new CopyOnWriteArrayList<>();
-                        _sessions.put(browserId, sessions);
-                    }
-                    sessions.add(session);
-                }
-
-                session.addListener(new ServerSession.RemoveListener() {
-                    @Override
-                    public void removed(ServerSession session, boolean timeout) {
-                        synchronized (_sessions) {
-                            Collection<ServerSessionImpl> sessions = _sessions.get(browserId);
-                            sessions.remove(session);
-                            if (sessions.isEmpty()) {
-                                _sessions.remove(browserId);
-                            }
+    protected CompletableFuture<ServerMessage.Mutable> processMetaHandshake(HttpServletRequest request, HttpServletResponse response, ServerSessionImpl ss, ServerMessage.Mutable message) {
+        return bayeuxServerHandle(ss, message)
+                .thenApply(reply -> {
+                    ServerSessionImpl session = (ServerSessionImpl)getBayeux().getSession(reply.getClientId());
+                    if (session != null) {
+                        String id = findBrowserId(request);
+                        if (id == null) {
+                            id = setBrowserId(request, response);
                         }
+                        final String browserId = id;
+                        session.setBrowserId(browserId);
+                        synchronized (_sessions) {
+                            // The list is modified inside sync blocks, but
+                            // iterated outside, so it must be concurrent.
+                            Collection<ServerSessionImpl> sessions = _sessions.computeIfAbsent(browserId, k -> new CopyOnWriteArrayList<>());
+                            sessions.add(session);
+                        }
+
+                        session.addListener((ServerSession.RemoveListener)(s, timeout) -> {
+                            synchronized (_sessions) {
+                                Collection<ServerSessionImpl> sessions = _sessions.get(browserId);
+                                sessions.remove(s);
+                                if (sessions.isEmpty()) {
+                                    _sessions.remove(browserId);
+                                }
+                            }
+                        });
                     }
+                    return reply;
                 });
-            }
-        }
-        return reply;
     }
 
-    protected ServerMessage.Mutable processMetaConnect(HttpServletRequest request, HttpServletResponse response, ServerSessionImpl session, ServerMessage.Mutable message) {
+    protected CompletableFuture<ServerMessage.Mutable> processMetaConnect(HttpServletRequest request, HttpServletResponse response, ServerSessionImpl session, ServerMessage.Mutable message) {
         if (session != null) {
             // Cancel the previous scheduler to cancel any prior waiting long poll.
             // This should also decrement the browser ID.
@@ -283,53 +286,53 @@ public abstract class AbstractHttpTransport extends AbstractServerTransport {
         }
 
         boolean wasConnected = session != null && session.isConnected();
-        ServerMessage.Mutable reply = bayeuxServerHandle(session, message);
-        if (reply != null && session != null) {
-            if (!session.hasNonLazyMessages() && reply.isSuccessful()) {
-                // Detect if we have multiple sessions from the same browser.
-                boolean allowSuspendConnect = incBrowserId(session, isHTTP2(request));
-                if (allowSuspendConnect) {
-                    long timeout = session.calculateTimeout(getTimeout());
 
-                    // Support old clients that do not send advice:{timeout:0} on the first connect
-                    if (timeout > 0 && wasConnected && session.isConnected()) {
-                        // Between the last time we checked for messages in the queue
-                        // (which was false, otherwise we would not be in this branch)
-                        // and now, messages may have been added to the queue.
-                        // We will suspend anyway, but setting the scheduler on the
-                        // session will decide atomically if we need to resume or not.
+        return bayeuxServerHandle(session, message).thenApply(reply -> {
+            if (session != null) {
+                if (!session.hasNonLazyMessages() && reply.isSuccessful()) {
+                    // Detect if we have multiple sessions from the same browser.
+                    boolean allowSuspendConnect = incBrowserId(session, isHTTP2(request));
+                    if (allowSuspendConnect) {
+                        long timeout = session.calculateTimeout(getTimeout());
 
-                        HttpScheduler scheduler = suspend(request, response, session, reply, timeout);
-                        metaConnectSuspended(request, response, scheduler.getAsyncContext(), session);
-                        // Setting the scheduler may resume the /meta/connect
-                        session.setScheduler(scheduler);
-                        reply = null;
+                        // Support old clients that do not send advice:{timeout:0} on the first connect
+                        if (timeout > 0 && wasConnected && session.isConnected()) {
+                            // Between the last time we checked for messages in the queue
+                            // (which was false, otherwise we would not be in this branch)
+                            // and now, messages may have been added to the queue.
+                            // We will suspend anyway, but setting the scheduler on the
+                            // session will decide atomically if we need to resume or not.
+
+                            HttpScheduler scheduler = suspend(request, response, session, reply, timeout);
+                            metaConnectSuspended(request, response, scheduler.getAsyncContext(), session);
+                            // Setting the scheduler may resume the /meta/connect
+                            session.setScheduler(scheduler);
+                            reply = null;
+                        } else {
+                            decBrowserId(session, isHTTP2(request));
+                        }
                     } else {
-                        decBrowserId(session, isHTTP2(request));
-                    }
-                } else {
-                    // There are multiple sessions from the same browser
-                    Map<String, Object> advice = reply.getAdvice(true);
-                    advice.put("multiple-clients", true);
+                        // There are multiple sessions from the same browser
+                        Map<String, Object> advice = reply.getAdvice(true);
+                        advice.put("multiple-clients", true);
 
-                    long multiSessionInterval = getMultiSessionInterval();
-                    if (multiSessionInterval > 0) {
-                        advice.put(Message.RECONNECT_FIELD, Message.RECONNECT_RETRY_VALUE);
-                        advice.put(Message.INTERVAL_FIELD, multiSessionInterval);
-                    } else {
-                        advice.put(Message.RECONNECT_FIELD, Message.RECONNECT_NONE_VALUE);
-                        reply.setSuccessful(false);
+                        long multiSessionInterval = getMultiSessionInterval();
+                        if (multiSessionInterval > 0) {
+                            advice.put(Message.RECONNECT_FIELD, Message.RECONNECT_RETRY_VALUE);
+                            advice.put(Message.INTERVAL_FIELD, multiSessionInterval);
+                        } else {
+                            advice.put(Message.RECONNECT_FIELD, Message.RECONNECT_NONE_VALUE);
+                            reply.setSuccessful(false);
+                        }
+                        session.reAdvise();
                     }
-                    session.reAdvise();
+                }
+                if (reply != null && session.isDisconnected()) {
+                    reply.getAdvice(true).put(Message.RECONNECT_FIELD, Message.RECONNECT_NONE_VALUE);
                 }
             }
-
-            if (reply != null && session.isDisconnected()) {
-                reply.getAdvice(true).put(Message.RECONNECT_FIELD, Message.RECONNECT_NONE_VALUE);
-            }
-        }
-
-        return reply;
+            return reply;
+        });
     }
 
     protected boolean isHTTP2(HttpServletRequest request) {
@@ -354,7 +357,11 @@ public abstract class AbstractHttpTransport extends AbstractServerTransport {
             reply.getAdvice(true).put(Message.RECONNECT_FIELD, Message.RECONNECT_NONE_VALUE);
         }
 
-        flush(request, response, session, true, true, processReply(session, reply));
+        processReply(session, reply).thenAccept(r -> {
+            if (r != null) {
+                flush(request, response, session, true, true, r);
+            }
+        });
     }
 
     public BayeuxContext getContext() {
@@ -488,7 +495,7 @@ public abstract class AbstractHttpTransport extends AbstractServerTransport {
         }
     }
 
-    protected ServerMessage.Mutable bayeuxServerHandle(ServerSessionImpl session, ServerMessage.Mutable message) {
+    protected CompletableFuture<ServerMessage.Mutable> bayeuxServerHandle(ServerSessionImpl session, ServerMessage.Mutable message) {
         return getBayeux().handle(session, message);
     }
 
@@ -774,5 +781,18 @@ public abstract class AbstractHttpTransport extends AbstractServerTransport {
             decBrowserId(session, isHTTP2(request));
             AbstractHttpTransport.this.error(getRequest(), getResponse(), getAsyncContext(), code);
         }
+    }
+
+    private static class Context {
+        private HttpServletRequest request;
+        private HttpServletResponse response;
+        private ServerMessage.Mutable[] messages;
+        private Collection<ServerSessionImpl> sessions;
+        private ServerSessionImpl session;
+        private boolean batch;
+        private List<ServerMessage.Mutable> replies;
+        private boolean sendQueue;
+        private boolean sendReplies;
+        private boolean scheduleExpiration;
     }
 }

@@ -20,6 +20,7 @@ import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.nio.charset.UnsupportedCharsetException;
 import java.text.ParseException;
+import java.util.concurrent.CompletableFuture;
 
 import org.cometd.bayeux.server.ServerMessage;
 import org.cometd.bayeux.server.ServerTransport;
@@ -206,11 +207,12 @@ public abstract class AbstractServerTransport extends AbstractTransport implemen
     protected void sweep() {
     }
 
-    protected ServerMessage.Mutable processReply(ServerSessionImpl session, ServerMessage.Mutable reply) {
+    protected CompletableFuture<ServerMessage.Mutable> processReply(ServerSessionImpl session, ServerMessage.Mutable reply) {
         if (reply != null) {
-            reply = getBayeux().extendReply(session, session, reply);
+            return getBayeux().extendReply(session, session, reply);
+        } else {
+            return CompletableFuture.completedFuture(null);
         }
-        return reply;
     }
 
     protected byte[] toJSONBytes(ServerMessage message, String encoding) {

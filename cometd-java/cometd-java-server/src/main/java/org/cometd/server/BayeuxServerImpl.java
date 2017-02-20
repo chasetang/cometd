@@ -25,15 +25,17 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.ListIterator;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 import javax.servlet.http.HttpServletRequest;
 
@@ -41,11 +43,11 @@ import org.cometd.bayeux.Channel;
 import org.cometd.bayeux.ChannelId;
 import org.cometd.bayeux.MarkedReference;
 import org.cometd.bayeux.Message;
+import org.cometd.bayeux.Promise;
 import org.cometd.bayeux.server.Authorizer;
 import org.cometd.bayeux.server.BayeuxContext;
 import org.cometd.bayeux.server.BayeuxServer;
 import org.cometd.bayeux.server.ConfigurableServerChannel.Initializer;
-import org.cometd.bayeux.server.ConfigurableServerChannel.ServerChannelListener;
 import org.cometd.bayeux.server.LocalSession;
 import org.cometd.bayeux.server.SecurityPolicy;
 import org.cometd.bayeux.server.ServerChannel;
@@ -453,7 +455,7 @@ public class BayeuxServerImpl extends AbstractLifeCycle implements BayeuxServer,
         }
         // Another thread may add this channel concurrently, so wait until it is initialized
         channel.waitForInitialized();
-        return new MarkedReference<ServerChannel>(channel, initialized);
+        return new MarkedReference<>(channel, initialized);
     }
 
     private void notifyConfigureChannel(Initializer listener, ServerChannel channel) {
@@ -627,33 +629,45 @@ public class BayeuxServerImpl extends AbstractLifeCycle implements BayeuxServer,
         _listeners.remove(listener);
     }
 
-    public ServerMessage.Mutable handle(ServerSessionImpl session, ServerMessage.Mutable message) {
-        if (_logger.isDebugEnabled()) {
-            _logger.debug(">  {} {}", message, session);
-        }
-
+    public CompletableFuture<ServerMessage.Mutable> handle(ServerSessionImpl session, ServerMessage.Mutable message) {
         if (_validation) {
             validateMessage(message);
         }
 
         Mutable reply = createReply(message);
-        if (!extendRecv(session, message) || session != null && !session.extendRecv(message)) {
-            error(reply, "404::message deleted");
-        } else {
-            if (_logger.isDebugEnabled()) {
-                _logger.debug(">> {}", message);
-            }
 
-            handle(session, message, reply);
-        }
-
-        if (_logger.isDebugEnabled()) {
-            _logger.debug("<< {}", reply);
-        }
-        return reply;
+        return extendIncoming(session, message)
+                .thenCompose(b -> {
+                    if (b) {
+                        if (session != null) {
+                            return session.extendIncoming(message);
+                        }
+                    }
+                    return CompletableFuture.completedFuture(b);
+                })
+                .thenCompose(b -> {
+                    if (b) {
+                        if (_logger.isDebugEnabled()) {
+                            _logger.debug(">> {}", message);
+                        }
+                        CompletableFuture<?> cf = handle(session, message, reply);
+                        if (_logger.isDebugEnabled()) {
+                            _logger.debug("After handle, CF={} - {}", cf.isDone(), message);
+                        }
+                        return cf;
+                    } else {
+                        error(reply, "404::message deleted");
+                        return CompletableFuture.completedFuture(null);
+                    }
+                }).thenApply(y -> {
+                    if (_logger.isDebugEnabled()) {
+                        _logger.debug("<< {}", reply);
+                    }
+                    return reply;
+                });
     }
 
-    private void handle(ServerSessionImpl session, Mutable message, Mutable reply) {
+    private CompletableFuture<?> handle(ServerSessionImpl session, Mutable message, Mutable reply) {
         String channelName = message.getChannel();
 
         if (session != null) {
@@ -662,44 +676,63 @@ public class BayeuxServerImpl extends AbstractLifeCycle implements BayeuxServer,
 
         if (channelName == null) {
             error(reply, "400::channel missing");
+            return CompletableFuture.completedFuture(null);
         } else {
-            ServerChannelImpl channel = getServerChannel(channelName);
-            if (channel == null) {
-                if (session == null) {
-                    unknownSession(reply);
-                } else {
-                    Authorizer.Result creationResult = isCreationAuthorized(session, message, channelName);
-                    if (creationResult instanceof Authorizer.Result.Denied) {
-                        String denyReason = ((Authorizer.Result.Denied)creationResult).getReason();
-                        error(reply, "403:" + denyReason + ":create denied");
-                    } else {
-                        channel = (ServerChannelImpl)createChannelIfAbsent(channelName).getReference();
-                    }
-                }
-            }
-
-            if (channel != null) {
-                if (channel.isMeta()) {
-                    if (session == null && !Channel.META_HANDSHAKE.equals(channelName)) {
-                        unknownSession(reply);
-                    } else {
-                        doPublish(session, channel, message, true);
-                    }
-                } else {
-                    if (session == null) {
-                        unknownSession(reply);
-                    } else {
-                        Authorizer.Result publishResult = isPublishAuthorized(channel, session, message);
-                        if (publishResult instanceof Authorizer.Result.Denied) {
-                            String denyReason = ((Authorizer.Result.Denied)publishResult).getReason();
-                            error(reply, "403:" + denyReason + ":publish denied");
+            return CompletableFuture.completedFuture(getServerChannel(channelName))
+                    .thenCompose(channel -> {
+                        if (channel == null) {
+                            if (session == null) {
+                                unknownSession(reply);
+                                return CompletableFuture.completedFuture(null);
+                            } else {
+                                return isCreationAuthorized(session, message, channelName).thenApply(r -> {
+                                    if (r.isDenied()) {
+                                        String denyReason = ((Authorizer.Result.Denied)r).getReason();
+                                        error(reply, "403:" + denyReason + ":create denied");
+                                        return null;
+                                    } else {
+                                        return (ServerChannelImpl)createChannelIfAbsent(channelName).getReference();
+                                    }
+                                });
+                            }
                         } else {
-                            doPublish(session, channel, message, true);
-                            reply.setSuccessful(true);
+                            return CompletableFuture.completedFuture(channel);
                         }
-                    }
-                }
-            }
+                    })
+                    .thenCompose(channel -> {
+                        if (channel != null) {
+                            if (channel.isMeta()) {
+                                if (session == null && !Channel.META_HANDSHAKE.equals(channelName)) {
+                                    unknownSession(reply);
+                                    return CompletableFuture.completedFuture(null);
+                                } else {
+                                    CompletableFuture<Boolean> cf = doPublish(session, channel, message, true);
+                                    if (_logger.isDebugEnabled()) {
+                                        _logger.debug("After doPublish CF={} - {}", cf.isDone(), message);
+                                    }
+                                    return cf;
+                                }
+                            } else {
+                                if (session == null) {
+                                    unknownSession(reply);
+                                    return CompletableFuture.completedFuture(null);
+                                } else {
+                                    return isPublishAuthorized(channel, session, message).thenCompose(r -> {
+                                        if (r.isDenied()) {
+                                            String denyReason = ((Authorizer.Result.Denied)r).getReason();
+                                            error(reply, "403:" + denyReason + ":publish denied");
+                                            return CompletableFuture.completedFuture(null);
+                                        } else {
+                                            reply.setSuccessful(true);
+                                            return doPublish(session, channel, message, true);
+                                        }
+                                    });
+                                }
+                            }
+                        } else {
+                            return CompletableFuture.completedFuture(null);
+                        }
+                    });
         }
     }
 
@@ -724,101 +757,170 @@ public class BayeuxServerImpl extends AbstractLifeCycle implements BayeuxServer,
         return true;
     }
 
-    private Authorizer.Result isPublishAuthorized(ServerChannel channel, ServerSession session, ServerMessage message) {
-        if (_policy != null && !_policy.canPublish(this, session, channel, message)) {
-            _logger.warn("{} denied Publish@{} by {}", session, channel.getId(), _policy);
-            return Authorizer.Result.deny("denied_by_security_policy");
+    private CompletableFuture<Boolean> extendIncoming(ServerSession session, ServerMessage.Mutable message) {
+        if (_logger.isDebugEnabled()) {
+            _logger.debug(">  {} {}", message, session);
         }
-        return isOperationAuthorized(Authorizer.Operation.PUBLISH, session, message, channel.getChannelId());
+        return _extensions.stream().reduce(CompletableFuture.completedFuture(true),
+                (cf, extension) -> cf.thenCompose(r -> {
+                    if (r) {
+                        Promise.Completable<Boolean> c = new Promise.Completable<>();
+                        try {
+                            extension.incoming(session, message, c);
+                        } catch (Throwable x) {
+                            _logger.info("Exception while invoking extension " + extension, x);
+                            c.succeed(true);
+                        }
+                        return c;
+                    } else {
+                        return CompletableFuture.completedFuture(false);
+                    }
+                }),
+                this::combineBooleans);
     }
 
-    private Authorizer.Result isSubscribeAuthorized(ServerChannel channel, ServerSession session, ServerMessage message) {
-        if (_policy != null && !_policy.canSubscribe(this, session, channel, message)) {
-            _logger.warn("{} denied Subscribe@{} by {}", session, channel, _policy);
-            return Authorizer.Result.deny("denied_by_security_policy");
-        }
-        return isOperationAuthorized(Authorizer.Operation.SUBSCRIBE, session, message, channel.getChannelId());
-    }
-
-    private Authorizer.Result isCreationAuthorized(ServerSession session, ServerMessage message, String channel) {
-        if (_policy != null && !_policy.canCreate(BayeuxServerImpl.this, session, channel, message)) {
-            _logger.warn("{} denied Create@{} by {}", session, message.getChannel(), _policy);
-            return Authorizer.Result.deny("denied_by_security_policy");
-        }
-        return isOperationAuthorized(Authorizer.Operation.CREATE, session, message, new ChannelId(channel));
-    }
-
-    private Authorizer.Result isOperationAuthorized(Authorizer.Operation operation, ServerSession session, ServerMessage message, ChannelId channelId) {
-        Authorizer.Result result = isChannelOperationAuthorized(operation, session, message, channelId);
-
-        if (result == null) {
-            result = Authorizer.Result.grant();
-            if (_logger.isDebugEnabled()) {
-                _logger.debug("No authorizers, {} for channel {} {}", operation, channelId, result);
-            }
+    private CompletableFuture<Authorizer.Result> isPublishAuthorized(ServerChannel channel, ServerSession session, ServerMessage message) {
+        if (_policy != null) {
+            Promise.Completable<Boolean> c = new Promise.Completable<>();
+            _policy.canPublish(this, session, channel, message, c);
+            return c.thenCompose(b -> {
+                if (b) {
+                    return isOperationAuthorized(Authorizer.Operation.PUBLISH, session, message, channel.getChannelId());
+                } else {
+                    _logger.warn("{} denied Publish@{} by {}", session, channel.getId(), _policy);
+                    return CompletableFuture.completedFuture(Authorizer.Result.deny("denied_by_security_policy"));
+                }
+            });
         } else {
-            if (result.isGranted()) {
-                if (_logger.isDebugEnabled()) {
-                    _logger.debug("No authorizer denied {} for channel {}, authorization {}", operation, channelId, result);
-                }
-            } else if (!result.isDenied()) {
-                result = Authorizer.Result.deny("denied_by_not_granting");
-                if (_logger.isDebugEnabled()) {
-                    _logger.debug("No authorizer granted {} for channel {}, authorization {}", operation, channelId, result);
-                }
-            }
+            return isOperationAuthorized(Authorizer.Operation.PUBLISH, session, message, channel.getChannelId());
         }
-
-        // We need to make sure that this method returns a boolean result (granted or denied)
-        // but if it's denied, we need to return the object in order to access the deny reason
-        assert !(result instanceof Authorizer.Result.Ignored);
-        return result;
     }
 
-    private Authorizer.Result isChannelOperationAuthorized(Authorizer.Operation operation, ServerSession session, ServerMessage message, ChannelId channelId) {
-        Authorizer.Result result = null;
-        List<String> wilds = channelId.getWilds();
-        for (int i = 0, size = wilds.size(); i <= size; ++i) {
-            String channelName = i < size ? wilds.get(i) : channelId.getId();
-            ServerChannelImpl channel = _channels.get(channelName);
-            if (channel != null) {
-                Authorizer.Result authz = isChannelOperationAuthorized(channel, operation, session, message, channelId);
-                if (authz != null) {
-                    if (result == null || authz.isDenied() || authz.isGranted()) {
-                        result = authz;
-                    }
-                    if (authz.isDenied()) {
-                        break;
-                    }
+    private CompletableFuture<Authorizer.Result> isSubscribeAuthorized(ServerChannel channel, ServerSession session, ServerMessage message) {
+        if (_policy != null) {
+            Promise.Completable<Boolean> c = new Promise.Completable<>();
+            _policy.canSubscribe(this, session, channel, message, c);
+            return c.thenCompose(b -> {
+                if (b) {
+                    return isOperationAuthorized(Authorizer.Operation.SUBSCRIBE, session, message, channel.getChannelId());
+                } else {
+                    _logger.warn("{} denied Subscribe@{} by {}", session, channel, _policy);
+                    return CompletableFuture.completedFuture(Authorizer.Result.deny("denied_by_security_policy"));
                 }
-            }
+            });
+        } else {
+            return isOperationAuthorized(Authorizer.Operation.SUBSCRIBE, session, message, channel.getChannelId());
         }
-        return result;
     }
 
-    private Authorizer.Result isChannelOperationAuthorized(ServerChannelImpl channel, Authorizer.Operation operation, ServerSession session, ServerMessage message, ChannelId channelId) {
+    private CompletableFuture<Authorizer.Result> isCreationAuthorized(ServerSession session, ServerMessage message, String channel) {
+        if (_policy != null) {
+            Promise.Completable<Boolean> c = new Promise.Completable<>();
+            _policy.canCreate(this, session, channel, message, c);
+            return c.thenCompose(b -> {
+                if (b) {
+                    return isOperationAuthorized(Authorizer.Operation.CREATE, session, message, new ChannelId(channel));
+                } else {
+                    _logger.warn("{} denied Create@{} by {}", session, message.getChannel(), _policy);
+                    return CompletableFuture.completedFuture(Authorizer.Result.deny("denied_by_security_policy"));
+                }
+            });
+        } else {
+            return isOperationAuthorized(Authorizer.Operation.CREATE, session, message, new ChannelId(channel));
+        }
+    }
+
+    private CompletableFuture<Authorizer.Result> isOperationAuthorized(Authorizer.Operation operation, ServerSession session, ServerMessage message, ChannelId channelId) {
+        return isChannelOperationAuthorized(operation, session, message, channelId)
+                .thenApply(result -> {
+                    if (result == null) {
+                        result = Authorizer.Result.grant();
+                        if (_logger.isDebugEnabled()) {
+                            _logger.debug("No authorizers, {} for channel {} {}", operation, channelId, result);
+                        }
+                    } else {
+                        if (result.isGranted()) {
+                            if (_logger.isDebugEnabled()) {
+                                _logger.debug("No authorizer denied {} for channel {}, authorization {}", operation, channelId, result);
+                            }
+                        } else if (!result.isDenied()) {
+                            result = Authorizer.Result.deny("denied_by_not_granting");
+                            if (_logger.isDebugEnabled()) {
+                                _logger.debug("No authorizer granted {} for channel {}, authorization {}", operation, channelId, result);
+                            }
+                        }
+                    }
+                    return result;
+                });
+    }
+
+    private CompletableFuture<Authorizer.Result> isChannelOperationAuthorized(Authorizer.Operation operation, ServerSession session, ServerMessage message, ChannelId channelId) {
+        List<String> channels = new ArrayList<>(channelId.getWilds());
+        channels.add(channelId.getId());
+        return channels.stream().reduce(CompletableFuture.completedFuture(null),
+                (cf, channelName) -> cf.thenCompose(result -> {
+                    if (result != null && result.isDenied()) {
+                        return CompletableFuture.completedFuture(result);
+                    } else {
+                        ServerChannelImpl channel = _channels.get(channelName);
+                        if (channel != null) {
+                            return isChannelOperationAuthorized(channel, operation, session, message, channelId).thenApply(authz -> {
+                                if (authz != null) {
+                                    if (result == null || authz.isDenied() || authz.isGranted()) {
+                                        return authz;
+                                    }
+                                }
+                                return result;
+                            });
+                        } else {
+                            return CompletableFuture.completedFuture(result);
+                        }
+                    }
+                }), this::combineAuthorizerResults);
+    }
+
+    private CompletableFuture<Authorizer.Result> isChannelOperationAuthorized(ServerChannelImpl channel, Authorizer.Operation operation, ServerSession session, ServerMessage message, ChannelId channelId) {
         List<Authorizer> authorizers = channel.authorizers();
         if (authorizers.isEmpty()) {
-            return null;
+            return CompletableFuture.completedFuture(null);
         }
 
-        Authorizer.Result result = Authorizer.Result.ignore();
-        for (Authorizer authorizer : authorizers) {
-            Authorizer.Result authorization = authorizer.authorize(operation, channelId, session, message);
-            if (_logger.isDebugEnabled()) {
-                _logger.debug("Authorizer {} on channel {} {} {} for channel {}", authorizer, channel, authorization, operation, channelId);
-            }
-            if (authorization.isDenied()) {
-                result = authorization;
-                break;
-            } else if (authorization.isGranted()) {
-                result = authorization;
-            }
-        }
-        return result;
+        return authorizers.stream().reduce(CompletableFuture.completedFuture(Authorizer.Result.ignore()),
+                (cf, authorizer) -> cf.thenCompose(result -> {
+                    if (result.isDenied()) {
+                        return CompletableFuture.completedFuture(result);
+                    } else {
+                        Promise.Completable<Authorizer.Result> c = new Promise.Completable<>();
+                        authorizer.authorize(operation, channelId, session, message, c);
+                        return c.thenApply(authorization -> {
+                            if (_logger.isDebugEnabled()) {
+                                _logger.debug("Authorizer {} on channel {} {} {} for channel {}", authorizer, channel, authorization, operation, channelId);
+                            }
+                            if (authorization.isDenied() || authorization.isGranted()) {
+                                return authorization;
+                            } else {
+                                return result;
+                            }
+                        });
+                    }
+                }), this::combineAuthorizerResults);
     }
 
-    protected void doPublish(ServerSessionImpl from, ServerChannelImpl to, final ServerMessage.Mutable mutable, boolean receiving) {
+    private CompletableFuture<Authorizer.Result> combineAuthorizerResults(CompletableFuture<Authorizer.Result> cf1, CompletableFuture<Authorizer.Result> cf2) {
+        return cf1.thenCombine(cf2, (r1, r2) -> {
+            if (r1.isDenied()) {
+                return r1;
+            } else if (r2.isDenied()) {
+                return r2;
+            } else if (r1.isGranted() || r2.isGranted()) {
+                return Authorizer.Result.grant();
+            } else {
+                return Authorizer.Result.ignore();
+            }
+        });
+    }
+
+    protected CompletableFuture<Boolean> doPublish(ServerSessionImpl from, ServerChannelImpl to, final ServerMessage.Mutable mutable, boolean receiving) {
         boolean broadcast = to.isBroadcast();
         if (broadcast) {
             // Do not leak the clientId to other subscribers
@@ -832,92 +934,103 @@ public class BayeuxServerImpl extends AbstractLifeCycle implements BayeuxServer,
         List<String> wildChannels = to.getChannelId().getWilds();
 
         // First notify the channel listeners.
-        if (!notifyListeners(from, to, mutable, wildChannels)) {
-            return;
-        }
-
-        if (broadcast && receiving) {
-            if (!extendSend(from, null, mutable)) {
-                return;
-            }
-        }
-
-        // Exactly at this point, we convert the message to JSON and therefore
-        // any further modification will be lost.
-        // This is an optimization so that if the message is sent to a million
-        // subscribers, we generate the JSON only once.
-        // From now on, user code is passed a ServerMessage reference (and not
-        // ServerMessage.Mutable), and we attempt to return immutable data
-        // structures, even if it is not possible to guard against all cases.
-        // For example, it is impossible to prevent things like
-        // ((CustomObject)serverMessage.getData()).change() or
-        // ((Map)serverMessage.getExt().get("map")).put().
-        if (broadcast || !receiving) {
-            freeze(mutable);
-        }
-
-        // Call the wild subscribers, which can only get broadcast messages.
-        // We need a special treatment in case of subscription to /**, otherwise
-        // we will deliver meta messages and service messages as if it could be
-        // possible to subscribe to meta channels and service channels.
-        if (broadcast) {
-            Set<String> wildSubscribers = null;
-            for (String wildName : wildChannels) {
-                ServerChannelImpl wildChannel = _channels.get(wildName);
-                if (wildChannel == null) {
-                    continue;
+        CompletableFuture<Boolean> cfListeners = notifyListeners(from, to, mutable, wildChannels);
+        CompletableFuture<Boolean> cfExtensions = cfListeners.thenCompose(b -> {
+            if (b) {
+                if (broadcast && receiving) {
+                    return extendOutgoing(from, null, mutable);
+                } else {
+                    return CompletableFuture.completedFuture(true);
                 }
-                Set<ServerSession> subscribers = wildChannel.subscribers();
-                for (ServerSession session : subscribers) {
-                    if (wildSubscribers == null) {
-                        wildSubscribers = new HashSet<>();
-                    }
-                    if (wildSubscribers.add(session.getId())) {
-                        ((ServerSessionImpl)session).doDeliver(from, mutable);
-                    }
-                }
+            } else {
+                return CompletableFuture.completedFuture(false);
             }
+        });
 
-            // Call the leaf subscribers
-            Set<ServerSession> subscribers = to.subscribers();
-            for (ServerSession session : subscribers) {
-                if (wildSubscribers == null || !wildSubscribers.contains(session.getId())) {
-                    ((ServerSessionImpl)session).doDeliver(from, mutable);
+        return cfExtensions.thenCompose(b -> {
+            if (b) {
+                // Exactly at this point, we convert the message to JSON and therefore
+                // any further modification will be lost.
+                // This is an optimization so that if the message is sent to a million
+                // subscribers, we generate the JSON only once.
+                // From now on, user code is passed a ServerMessage reference (and not
+                // ServerMessage.Mutable), and we attempt to return immutable data
+                // structures, even if it is not possible to guard against all cases.
+                // For example, it is impossible to prevent things like
+                // ((CustomObject)serverMessage.getData()).change() or
+                // ((Map)serverMessage.getExt().get("map")).put().
+                if (broadcast || !receiving) {
+                    freeze(mutable);
                 }
+
+                if (broadcast) {
+                    Set<String> wildSubscribers = new HashSet<>();
+                    return wildChannels.stream()
+                            .map(_channels::get)
+                            .filter(Objects::nonNull)
+                            .flatMap(wildChannel -> wildChannel.subscribers().stream())
+                            .filter(session -> wildSubscribers.add(session.getId()))
+                            .reduce(CompletableFuture.completedFuture(false),
+                                    (cf, session) -> cf.thenCompose(bb -> ((ServerSessionImpl)session).doDeliver(from, mutable)
+                                            .thenApply(dd -> bb || dd)),
+                                    this::combineBooleans)
+                            .thenCompose(y -> to.subscribers().stream()
+                                    .filter(session -> !wildSubscribers.contains(session.getId()))
+                                    .reduce(CompletableFuture.completedFuture(false),
+                                            (cf, session) -> cf.thenCompose(bb -> ((ServerSessionImpl)session).doDeliver(from, mutable)
+                                                    .thenApply(dd -> bb || dd)),
+                                            this::combineBooleans));
+                } else if (to.isMeta()) {
+                    return notifyHandlerListeners(from, to, mutable);
+                } else {
+                    return CompletableFuture.completedFuture(false);
+                }
+            } else {
+                return CompletableFuture.completedFuture(false);
             }
-        } else if (to.isMeta()) {
-            notifyHandlerListeners(from, to, mutable);
-        }
+        });
     }
 
-    private boolean notifyListeners(ServerSessionImpl from, ServerChannelImpl to, Mutable mutable, List<String> wildChannels) {
-        for (int i = 0, size = wildChannels.size(); i <= size; ++i) {
-            ServerChannelImpl channel = i == size ? to : _channels.get(wildChannels.get(i));
-            if (channel == null) {
-                continue;
-            }
-            if (channel.isLazy()) {
-                mutable.setLazy(true);
-            }
-            List<ServerChannelListener> listeners = channel.listeners();
-            for (ServerChannelListener listener : listeners) {
-                if (listener instanceof MessageListener) {
-                    if (!notifyOnMessage((MessageListener)listener, from, to, mutable)) {
-                        return false;
+    private CompletableFuture<Boolean> notifyListeners(ServerSessionImpl from, ServerChannelImpl to, Mutable mutable, List<String> wildChannels) {
+        List<ServerChannelImpl> channels = wildChannels.stream()
+                .map(_channels::get)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toList());
+        channels.add(to);
+        return channels.stream().reduce(CompletableFuture.completedFuture(true),
+                (cfChannel, channel) -> cfChannel.thenCompose(bChannel -> {
+                    if (bChannel) {
+                        if (channel.isLazy()) {
+                            mutable.setLazy(true);
+                        }
+                        return notifyListeners(channel, from, to, mutable);
+                    } else {
+                        return CompletableFuture.completedFuture(false);
                     }
-                }
-            }
-        }
-        return true;
+                }),
+                this::combineBooleans);
     }
 
-    private void notifyHandlerListeners(ServerSessionImpl from, ServerChannelImpl to, Mutable mutable) {
-        List<ServerChannelListener> listeners = to.listeners();
-        for (ServerChannelListener listener : listeners) {
-            if (listener instanceof HandlerListener) {
-                ((HandlerListener)listener).onMessage(from, mutable);
-            }
-        }
+    private CompletableFuture<Boolean> notifyListeners(ServerChannelImpl channel, ServerSessionImpl from, ServerChannelImpl to, Mutable mutable) {
+        return channel.listeners().stream()
+                .filter(listener -> listener instanceof MessageListener)
+                .reduce(CompletableFuture.completedFuture(true),
+                        (cfListener, listener) -> cfListener.thenCompose(bListener -> {
+                            if (bListener) {
+                                return notifyOnMessage((MessageListener)listener, from, to, mutable);
+                            } else {
+                                return CompletableFuture.completedFuture(false);
+                            }
+                        }),
+                        this::combineBooleans);
+    }
+
+    private CompletableFuture<Boolean> notifyHandlerListeners(ServerSessionImpl from, ServerChannelImpl to, Mutable mutable) {
+        return to.listeners().stream()
+                .filter(listener -> listener instanceof HandlerListener)
+                .reduce(CompletableFuture.completedFuture(null),
+                        (cf, listener) -> cf.thenCompose(y -> ((HandlerListener)listener).onMessage(from, mutable)),
+                        (cf1, cf2) -> cf1.thenCombine(cf2, (y1, y2) -> null));
     }
 
     public void freeze(Mutable mutable) {
@@ -931,97 +1044,56 @@ public class BayeuxServerImpl extends AbstractLifeCycle implements BayeuxServer,
         }
     }
 
-    private boolean notifyOnMessage(MessageListener listener, ServerSession from, ServerChannel to, Mutable mutable) {
+    private CompletableFuture<Boolean> notifyOnMessage(MessageListener listener, ServerSession from, ServerChannel to, Mutable mutable) {
+        Promise.Completable<Boolean> c = new Promise.Completable<>();
         try {
-            return listener.onMessage(from, to, mutable);
+            listener.onMessage(from, to, mutable, c);
         } catch (Throwable x) {
             _logger.info("Exception while invoking listener " + listener, x);
-            return true;
+            c.succeed(true);
         }
+        return c;
     }
 
-    public ServerMessage.Mutable extendReply(ServerSessionImpl from, ServerSessionImpl to, ServerMessage.Mutable reply) {
-        if (!extendSend(from, to, reply)) {
-            return null;
-        }
-
-        if (to != null) {
-            reply = to.extendSend(reply);
-        }
-
-        return reply;
-    }
-
-    protected boolean extendRecv(ServerSession from, ServerMessage.Mutable message) {
-        for (Extension extension : _extensions) {
-            boolean proceed = message.isMeta() ?
-                    notifyRcvMeta(extension, from, message) :
-                    notifyRcv(extension, from, message);
-            if (!proceed) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private boolean notifyRcvMeta(Extension extension, ServerSession from, Mutable message) {
-        try {
-            return extension.rcvMeta(from, message);
-        } catch (Throwable x) {
-            _logger.info("Exception while invoking extension " + extension, x);
-            return true;
-        }
-    }
-
-    private boolean notifyRcv(Extension extension, ServerSession from, Mutable message) {
-        try {
-            return extension.rcv(from, message);
-        } catch (Throwable x) {
-            _logger.info("Exception while invoking extension " + extension, x);
-            return true;
-        }
-    }
-
-    protected boolean extendSend(ServerSession from, ServerSession to, Mutable message) {
-        // Cannot use listIterator(int): it is not thread safe
-        ListIterator<Extension> i = _extensions.listIterator();
-        while (i.hasNext()) {
-            i.next();
-        }
-        while (i.hasPrevious()) {
-            final Extension extension = i.previous();
-            boolean proceed = message.isMeta() ?
-                    notifySendMeta(extension, to, message) :
-                    notifySend(extension, from, to, message);
-            if (!proceed) {
-                if (_logger.isDebugEnabled()) {
-                    _logger.debug("Extension {} interrupted message processing for {}", extension, message);
+    public CompletableFuture<ServerMessage.Mutable> extendReply(ServerSessionImpl from, ServerSessionImpl to, ServerMessage.Mutable reply) {
+        return extendOutgoing(from, to, reply).thenCompose(b -> {
+            if (b) {
+                if (to != null) {
+                    return to.extendOutgoing(reply);
+                } else {
+                    return CompletableFuture.completedFuture(reply);
                 }
-                return false;
+            } else {
+                return CompletableFuture.completedFuture(null);
             }
-        }
-        if (_logger.isDebugEnabled()) {
-            _logger.debug("<  {}", message);
-        }
-        return true;
+        });
     }
 
-    private boolean notifySendMeta(Extension extension, ServerSession to, Mutable message) {
-        try {
-            return extension.sendMeta(to, message);
-        } catch (Throwable x) {
-            _logger.info("Exception while invoking extension " + extension, x);
-            return true;
-        }
-    }
-
-    private boolean notifySend(Extension extension, ServerSession from, ServerSession to, Mutable message) {
-        try {
-            return extension.send(from, to, message);
-        } catch (Throwable x) {
-            _logger.info("Exception while invoking extension " + extension, x);
-            return true;
-        }
+    protected CompletableFuture<Boolean> extendOutgoing(ServerSession from, ServerSession to, ServerMessage.Mutable message) {
+        ArrayList<Extension> extensions = new ArrayList<>(_extensions);
+        Collections.reverse(extensions);
+        return extensions.stream().reduce(CompletableFuture.completedFuture(true),
+                (cf, extension) -> cf.thenCompose(b -> {
+                    Promise.Completable<Boolean> c = new Promise.Completable<>();
+                    if (b) {
+                        try {
+                            extension.outgoing(from, to, message, c);
+                        } catch (Throwable x) {
+                            _logger.info("Exception while invoking extension " + extension, x);
+                            c.complete(true);
+                        }
+                    } else {
+                        c.complete(false);
+                    }
+                    return c;
+                }),
+                this::combineBooleans)
+                .thenApply(b -> {
+                    if (_logger.isDebugEnabled()) {
+                        _logger.debug("<  {}", message);
+                    }
+                    return b;
+                });
     }
 
     protected boolean removeServerChannel(ServerChannelImpl channel) {
@@ -1045,6 +1117,10 @@ public class BayeuxServerImpl extends AbstractLifeCycle implements BayeuxServer,
         } catch (Throwable x) {
             _logger.info("Exception while invoking listener " + listener, x);
         }
+    }
+
+    CompletableFuture<Boolean> combineBooleans(CompletableFuture<Boolean> cf1, CompletableFuture<Boolean> cf2) {
+        return cf1.thenCombine(cf2, Boolean::logicalAnd);
     }
 
     protected List<BayeuxServerListener> getListeners() {
@@ -1256,7 +1332,7 @@ public class BayeuxServerImpl extends AbstractLifeCycle implements BayeuxServer,
 
             @Override
             public void dump(Appendable out, String indent) throws IOException {
-                List<ServerSession> sessions = new ArrayList<ServerSession>(_sessions.values());
+                List<ServerSession> sessions = new ArrayList<>(_sessions.values());
                 ContainerLifeCycle.dumpObject(out, "sessions: " + sessions.size());
                 if (isDetailedDump()) {
                     List<ServerSession> locals = new ArrayList<>();
@@ -1306,15 +1382,16 @@ public class BayeuxServerImpl extends AbstractLifeCycle implements BayeuxServer,
             return null;
         }
 
-        public abstract void onMessage(final ServerSessionImpl from, final ServerMessage.Mutable message);
+        public abstract CompletableFuture<Boolean> onMessage(final ServerSessionImpl from, final Mutable message);
     }
 
     private class HandshakeHandler extends HandlerListener {
         @Override
-        public void onMessage(ServerSessionImpl session, final Mutable message) {
-            if (session == null) {
-                session = newServerSession();
+        public CompletableFuture<Boolean> onMessage(ServerSessionImpl candidate, final Mutable message) {
+            if (candidate == null) {
+                candidate = newServerSession();
             }
+            ServerSessionImpl session = candidate;
 
             BayeuxContext context = getContext();
             if (context != null) {
@@ -1322,186 +1399,200 @@ public class BayeuxServerImpl extends AbstractLifeCycle implements BayeuxServer,
             }
 
             ServerMessage.Mutable reply = message.getAssociated();
-            if (_policy != null && !_policy.canHandshake(BayeuxServerImpl.this, session, message)) {
-                error(reply, "403::Handshake denied");
-                // The user's SecurityPolicy may have customized the response's advice
-                Map<String, Object> advice = reply.getAdvice(true);
-                if (!advice.containsKey(Message.RECONNECT_FIELD)) {
-                    advice.put(Message.RECONNECT_FIELD, Message.RECONNECT_NONE_VALUE);
-                }
-                return;
+
+            Promise.Completable<Boolean> c = new Promise.Completable<>();
+            if (_policy != null) {
+                _policy.canHandshake(BayeuxServerImpl.this, session, message, c);
+            } else {
+                c.complete(true);
             }
 
-            session.handshake();
-            addServerSession(session, message);
+            return c.thenApply(b -> {
+                if (b) {
+                    session.handshake();
+                    addServerSession(session, message);
 
-            reply.setSuccessful(true);
-            reply.put(Message.CLIENT_ID_FIELD, session.getId());
-            reply.put(Message.VERSION_FIELD, "1.0");
-            reply.put(Message.MIN_VERSION_FIELD, "1.0");
-            reply.put(Message.SUPPORTED_CONNECTION_TYPES_FIELD, getAllowedTransports());
+                    reply.setSuccessful(true);
+                    reply.put(Message.CLIENT_ID_FIELD, session.getId());
+                    reply.put(Message.VERSION_FIELD, "1.0");
+                    reply.put(Message.MIN_VERSION_FIELD, "1.0");
+                    reply.put(Message.SUPPORTED_CONNECTION_TYPES_FIELD, getAllowedTransports());
 
-            Map<String, Object> adviceOut = session.takeAdvice(getCurrentTransport());
-            reply.put(Message.ADVICE_FIELD, adviceOut);
+                    Map<String, Object> adviceOut = session.takeAdvice(getCurrentTransport());
+                    reply.put(Message.ADVICE_FIELD, adviceOut);
+                } else {
+                    error(reply, "403::Handshake denied");
+                    // The user's SecurityPolicy may have customized the response's advice
+                    Map<String, Object> advice = reply.getAdvice(true);
+                    if (!advice.containsKey(Message.RECONNECT_FIELD)) {
+                        advice.put(Message.RECONNECT_FIELD, Message.RECONNECT_NONE_VALUE);
+                    }
+                }
+                return b;
+            });
         }
     }
 
     private class ConnectHandler extends HandlerListener {
         @Override
-        public void onMessage(final ServerSessionImpl session, final Mutable message) {
+        public CompletableFuture<Boolean> onMessage(final ServerSessionImpl session, final Mutable message) {
             ServerMessage.Mutable reply = message.getAssociated();
-
             if (isSessionUnknown(session)) {
                 unknownSession(reply);
-                return;
-            }
-
-            session.connected();
-
-            // Handle incoming advice
-            Map<String, Object> adviceIn = message.getAdvice();
-            if (adviceIn != null) {
-                Number timeout = (Number)adviceIn.get("timeout");
-                session.updateTransientTimeout(timeout == null ? -1L : timeout.longValue());
-                Number interval = (Number)adviceIn.get("interval");
-                session.updateTransientInterval(interval == null ? -1L : interval.longValue());
-                // Force the server to send the advice, as the client may
-                // have forgotten it (for example because of a reload)
-                session.reAdvise();
             } else {
-                session.updateTransientTimeout(-1);
-                session.updateTransientInterval(-1);
-            }
+                session.connected();
 
-            // Send advice
-            Map<String, Object> adviceOut = session.takeAdvice(getCurrentTransport());
-            if (adviceOut != null) {
-                reply.put(Message.ADVICE_FIELD, adviceOut);
-            }
+                // Handle incoming advice
+                Map<String, Object> adviceIn = message.getAdvice();
+                if (adviceIn != null) {
+                    Number timeout = (Number)adviceIn.get("timeout");
+                    session.updateTransientTimeout(timeout == null ? -1L : timeout.longValue());
+                    Number interval = (Number)adviceIn.get("interval");
+                    session.updateTransientInterval(interval == null ? -1L : interval.longValue());
+                    // Force the server to send the advice, as the client may
+                    // have forgotten it (for example because of a reload)
+                    session.reAdvise();
+                } else {
+                    session.updateTransientTimeout(-1);
+                    session.updateTransientInterval(-1);
+                }
 
-            reply.setSuccessful(true);
+                // Send advice
+                Map<String, Object> adviceOut = session.takeAdvice(getCurrentTransport());
+                if (adviceOut != null) {
+                    reply.put(Message.ADVICE_FIELD, adviceOut);
+                }
+
+                reply.setSuccessful(true);
+            }
+            return CompletableFuture.completedFuture(true);
         }
     }
 
     private class SubscribeHandler extends HandlerListener {
         @Override
-        public void onMessage(final ServerSessionImpl from, final Mutable message) {
+        public CompletableFuture<Boolean> onMessage(final ServerSessionImpl from, final Mutable message) {
             ServerMessage.Mutable reply = message.getAssociated();
             if (isSessionUnknown(from)) {
                 unknownSession(reply);
-                return;
-            }
-
-            Object subscriptionField = message.get(Message.SUBSCRIPTION_FIELD);
-            if (subscriptionField == null) {
-                error(reply, "403::subscription_missing");
-                return;
-            }
-
-            List<String> subscriptions = toChannelList(subscriptionField);
-            if (subscriptions == null) {
-                error(reply, "403::subscription_invalid");
-                return;
-            }
-
-            validateSubscriptions(subscriptions);
-            reply.put(Message.SUBSCRIPTION_FIELD, subscriptionField);
-
-            for (String subscription : subscriptions) {
-                ServerChannelImpl channel = getServerChannel(subscription);
-                if (channel == null) {
-                    Authorizer.Result creationResult = isCreationAuthorized(from, message, subscription);
-                    if (creationResult instanceof Authorizer.Result.Denied) {
-                        String denyReason = ((Authorizer.Result.Denied)creationResult).getReason();
-                        error(reply, "403:" + denyReason + ":create_denied");
-                        break;
+            } else {
+                Object subscriptionField = message.get(Message.SUBSCRIPTION_FIELD);
+                if (subscriptionField == null) {
+                    error(reply, "403::subscription_missing");
+                } else {
+                    List<String> subscriptions = toChannelList(subscriptionField);
+                    if (subscriptions == null) {
+                        error(reply, "403::subscription_invalid");
                     } else {
-                        channel = (ServerChannelImpl)createChannelIfAbsent(subscription).getReference();
+                        validateSubscriptions(subscriptions);
+                        reply.put(Message.SUBSCRIPTION_FIELD, subscriptionField);
+                        return subscriptions.stream().reduce(CompletableFuture.completedFuture(null),
+                                (cf, subscription) -> cf.thenCompose(y -> CompletableFuture.completedFuture(getServerChannel(subscription))
+                                        .thenCompose(channel -> {
+                                            if (channel == null) {
+                                                return isCreationAuthorized(from, message, subscription)
+                                                        .thenApply(r -> {
+                                                            if (r.isDenied()) {
+                                                                String denyReason = ((Authorizer.Result.Denied)r).getReason();
+                                                                error(reply, "403:" + denyReason + ":create_denied");
+                                                                return null;
+                                                            } else {
+                                                                return (ServerChannelImpl)createChannelIfAbsent(subscription).getReference();
+                                                            }
+                                                        });
+                                            } else {
+                                                return CompletableFuture.completedFuture(channel);
+                                            }
+                                        })
+                                        .thenCompose(channel -> {
+                                            if (channel != null) {
+                                                return isSubscribeAuthorized(channel, from, message)
+                                                        .thenApply(r -> {
+                                                            if (r.isDenied()) {
+                                                                String denyReason = ((Authorizer.Result.Denied)r).getReason();
+                                                                error(reply, "403:" + denyReason + ":subscribe_denied");
+                                                            } else {
+                                                                // Reduces the window of time where a server-side expiration
+                                                                // or a concurrent disconnect causes the invalid client to be
+                                                                // registered as subscriber and hence being kept alive by the
+                                                                // fact that the channel references it.
+                                                                if (!isSessionUnknown(from)) {
+                                                                    if (channel.subscribe(from, message)) {
+                                                                        reply.setSuccessful(true);
+                                                                        return true;
+                                                                    } else {
+                                                                        error(reply, "403::subscribe_failed");
+                                                                    }
+                                                                } else {
+                                                                    unknownSession(reply);
+                                                                }
+                                                            }
+                                                            return false;
+                                                        });
+                                            } else {
+                                                return CompletableFuture.completedFuture(false);
+                                            }
+                                        })),
+                                BayeuxServerImpl.this::combineBooleans);
                     }
                 }
-
-                if (channel != null) {
-                    Authorizer.Result subscribeResult = isSubscribeAuthorized(channel, from, message);
-                    if (subscribeResult instanceof Authorizer.Result.Denied) {
-                        String denyReason = ((Authorizer.Result.Denied)subscribeResult).getReason();
-                        error(reply, "403:" + denyReason + ":subscribe_denied");
-                        break;
-                    } else {
-                        // Reduces the window of time where a server-side expiration
-                        // or a concurrent disconnect causes the invalid client to be
-                        // registered as subscriber and hence being kept alive by the
-                        // fact that the channel references it.
-                        if (!isSessionUnknown(from)) {
-                            if (channel.subscribe(from, message)) {
-                                reply.setSuccessful(true);
-                            } else {
-                                error(reply, "403::subscribe_failed");
-                                break;
-                            }
-                        } else {
-                            unknownSession(reply);
-                            break;
-                        }
-                    }
-                }
             }
+            return CompletableFuture.completedFuture(false);
         }
     }
 
     private class UnsubscribeHandler extends HandlerListener {
         @Override
-        public void onMessage(final ServerSessionImpl from, final Mutable message) {
+        public CompletableFuture<Boolean> onMessage(final ServerSessionImpl from, final Mutable message) {
             ServerMessage.Mutable reply = message.getAssociated();
             if (isSessionUnknown(from)) {
                 unknownSession(reply);
-                return;
-            }
-
-            Object subscriptionField = message.get(Message.SUBSCRIPTION_FIELD);
-            if (subscriptionField == null) {
-                error(reply, "403::subscription_missing");
-                return;
-            }
-
-            List<String> subscriptions = toChannelList(subscriptionField);
-            if (subscriptions == null) {
-                error(reply, "403::subscription_invalid");
-                return;
-            }
-
-            validateSubscriptions(subscriptions);
-            reply.put(Message.SUBSCRIPTION_FIELD, subscriptionField);
-
-            for (String subscription : subscriptions) {
-                ServerChannelImpl channel = getServerChannel(subscription);
-                if (channel == null) {
-                    error(reply, "400::channel_missing");
-                    break;
+            } else {
+                Object subscriptionField = message.get(Message.SUBSCRIPTION_FIELD);
+                if (subscriptionField == null) {
+                    error(reply, "403::subscription_missing");
                 } else {
-                    if (channel.unsubscribe(from, message)) {
-                        reply.setSuccessful(true);
+                    List<String> subscriptions = toChannelList(subscriptionField);
+                    if (subscriptions == null) {
+                        error(reply, "403::subscription_invalid");
                     } else {
-                        error(reply, "403::unsubscribe_failed");
-                        break;
+                        validateSubscriptions(subscriptions);
+                        reply.put(Message.SUBSCRIPTION_FIELD, subscriptionField);
+
+                        for (String subscription : subscriptions) {
+                            ServerChannelImpl channel = getServerChannel(subscription);
+                            if (channel == null) {
+                                error(reply, "400::channel_missing");
+                                break;
+                            } else {
+                                if (channel.unsubscribe(from, message)) {
+                                    reply.setSuccessful(true);
+                                } else {
+                                    error(reply, "403::unsubscribe_failed");
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
             }
+            return CompletableFuture.completedFuture(true);
         }
     }
 
     private class DisconnectHandler extends HandlerListener {
         @Override
-        public void onMessage(final ServerSessionImpl session, final Mutable message) {
+        public CompletableFuture<Boolean> onMessage(final ServerSessionImpl session, final Mutable message) {
             ServerMessage.Mutable reply = message.getAssociated();
             if (isSessionUnknown(session)) {
                 unknownSession(reply);
-                return;
+            } else {
+                reply.setSuccessful(true);
+                removeServerSession(session, false);
+                // Wake up the possibly pending /meta/connect
+                session.flush();
             }
-
-            reply.setSuccessful(true);
-            removeServerSession(session, false);
-            // Wake up the possibly pending /meta/connect
-            session.flush();
+            return CompletableFuture.completedFuture(true);
         }
     }
 }

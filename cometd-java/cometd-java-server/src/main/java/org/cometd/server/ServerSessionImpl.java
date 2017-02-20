@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Queue;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
@@ -32,6 +33,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import org.cometd.bayeux.Channel;
 import org.cometd.bayeux.Message;
+import org.cometd.bayeux.Promise;
 import org.cometd.bayeux.Session;
 import org.cometd.bayeux.server.LocalSession;
 import org.cometd.bayeux.server.ServerChannel;
@@ -185,7 +187,7 @@ public class ServerSessionImpl implements ServerSession, Dumpable {
     }
 
     public Set<ServerChannel> getSubscriptions() {
-        return Collections.<ServerChannel>unmodifiableSet(_subscribedTo.keySet());
+        return Collections.unmodifiableSet(_subscribedTo.keySet());
     }
 
     public void addExtension(Extension extension) {
@@ -209,57 +211,67 @@ public class ServerSessionImpl implements ServerSession, Dumpable {
         }
     }
 
-    public void deliver(Session sender, ServerMessage.Mutable message) {
-        ServerSession session = null;
+    public CompletableFuture<Boolean> deliver(Session sender, ServerMessage.Mutable message) {
+        ServerSession serverSession = null;
         if (sender instanceof ServerSession) {
-            session = (ServerSession)sender;
+            serverSession = (ServerSession)sender;
         } else if (sender instanceof LocalSession) {
-            session = ((LocalSession)sender).getServerSession();
+            serverSession = ((LocalSession)sender).getServerSession();
         }
+        ServerSession session = serverSession;
 
-        if (_bayeux.extendSend(session, this, message)) {
-            doDeliver(session, message);
-        }
+        return _bayeux.extendOutgoing(session, this, message)
+                .thenCompose(b -> {
+                    if (b) {
+                        return doDeliver(session, message);
+                    } else {
+                        return CompletableFuture.completedFuture(false);
+                    }
+                });
     }
 
-    public void deliver(Session sender, String channelId, Object data) {
+    public CompletableFuture<Boolean> deliver(Session sender, String channelId, Object data) {
         ServerMessage.Mutable message = _bayeux.newMessage();
         message.setChannel(channelId);
         message.setData(data);
-        deliver(sender, message);
+        return deliver(sender, message);
     }
 
-    protected void doDeliver(ServerSession sender, ServerMessage.Mutable mutable) {
+    protected CompletableFuture<Boolean> doDeliver(ServerSession sender, ServerMessage.Mutable mutable) {
         if (sender == this && !isBroadcastToPublisher()) {
-            return;
-        }
-
-        ServerMessage.Mutable message = extendSend(mutable);
-        if (message == null) {
-            return;
-        }
-
-        _bayeux.freeze(message);
-
-        for (ServerSessionListener listener : _listeners) {
-            if (listener instanceof MessageListener) {
-                if (!notifyOnMessage((MessageListener)listener, sender, message)) {
-                    return;
+            return CompletableFuture.completedFuture(false);
+        } else {
+            return extendOutgoing(mutable).thenCompose(message -> {
+                if (message != null) {
+                    _bayeux.freeze(message);
+                    return _listeners.stream()
+                            .filter(listener -> listener instanceof MessageListener)
+                            .reduce(CompletableFuture.completedFuture(true),
+                                    (cf, listener) -> cf.thenCompose(b1 -> {
+                                        if (b1) {
+                                            return notifyOnMessage((MessageListener)listener, sender, message);
+                                        } else {
+                                            return CompletableFuture.completedFuture(false);
+                                        }
+                                    }),
+                                    _bayeux::combineBooleans)
+                            .thenApply(b -> {
+                                if (b) {
+                                    Boolean wakeup = enqueueMessage(sender, message);
+                                    if (wakeup != null && wakeup) {
+                                        if (message.isLazy()) {
+                                            flushLazy(message);
+                                        } else {
+                                            flush();
+                                        }
+                                    }
+                                }
+                                return b;
+                            });
+                } else {
+                    return CompletableFuture.completedFuture(false);
                 }
-            }
-        }
-
-        Boolean wakeup = enqueueMessage(sender, message);
-        if (wakeup == null) {
-            return;
-        }
-
-        if (wakeup) {
-            if (message.isLazy()) {
-                flushLazy(message);
-            } else {
-                flush();
-            }
+            });
         }
     }
 
@@ -285,16 +297,16 @@ public class ServerSessionImpl implements ServerSession, Dumpable {
         }
     }
 
-    protected ServerMessage.Mutable extendSend(ServerMessage.Mutable mutable) {
-        ServerMessage.Mutable message = null;
-        if (mutable.isMeta()) {
-            if (extendSendMeta(mutable)) {
-                message = mutable;
-            }
-        } else {
-            message = extendSendMessage(mutable);
-        }
-        return message;
+    protected CompletableFuture<ServerMessage.Mutable> extendOutgoing(ServerMessage.Mutable mutable) {
+        return _extensions.stream().reduce(CompletableFuture.completedFuture(mutable),
+                (cf, extension) -> cf.thenCompose(m -> {
+                    if (m != null) {
+                        return notifyOutgoing(extension, m);
+                    } else {
+                        return CompletableFuture.completedFuture((ServerMessage.Mutable)null);
+                    }
+                }),
+                (cf1, cf2) -> cf1.thenCombine(cf2, (m1, m2) -> m1 == null || m2 == null ? null : m2));
     }
 
     private boolean notifyQueueMaxed(MaxQueueListener listener, ServerSession session, Queue<ServerMessage> queue, ServerSession sender, ServerMessage message) {
@@ -306,12 +318,14 @@ public class ServerSessionImpl implements ServerSession, Dumpable {
         }
     }
 
-    private boolean notifyOnMessage(MessageListener listener, ServerSession from, ServerMessage message) {
+    private CompletableFuture<Boolean> notifyOnMessage(MessageListener listener, ServerSession from, ServerMessage message) {
         try {
-            return listener.onMessage(this, from, message);
+            Promise.Completable<Boolean> c = new Promise.Completable<>();
+            listener.onMessage(this, from, message, c);
+            return c;
         } catch (Throwable x) {
             _logger.info("Exception while invoking listener " + listener, x);
-            return true;
+            return CompletableFuture.completedFuture(true);
         }
     }
 
@@ -603,85 +617,37 @@ public class ServerSessionImpl implements ServerSession, Dumpable {
         return _disconnected.get();
     }
 
-    protected boolean extendRecv(ServerMessage.Mutable message) {
-        for (Extension extension : _extensions) {
-            boolean proceed = message.isMeta() ?
-                    notifyRcvMeta(extension, message) :
-                    notifyRcv(extension, message);
-            if (!proceed) {
-                return false;
-            }
-        }
-        return true;
+    protected CompletableFuture<Boolean> extendIncoming(ServerMessage.Mutable message) {
+        return _extensions.stream().reduce(CompletableFuture.completedFuture(true),
+                (cf, extension) -> cf.thenCompose(b -> {
+                    if (b) {
+                        return notifyIncoming(extension, message);
+                    } else {
+                        return CompletableFuture.completedFuture(false);
+                    }
+                }),
+                _bayeux::combineBooleans);
     }
 
-    private boolean notifyRcvMeta(Extension extension, ServerMessage.Mutable message) {
+    private CompletableFuture<Boolean> notifyIncoming(Extension extension, ServerMessage.Mutable message) {
         try {
-            return extension.rcvMeta(this, message);
+            Promise.Completable<Boolean> c = new Promise.Completable<>();
+            extension.incoming(this, message, c);
+            return c;
         } catch (Throwable x) {
             _logger.info("Exception while invoking extension " + extension, x);
-            return true;
+            return CompletableFuture.completedFuture(true);
         }
     }
 
-    private boolean notifyRcv(Extension extension, ServerMessage.Mutable message) {
+    private CompletableFuture<ServerMessage.Mutable> notifyOutgoing(Extension extension, ServerMessage.Mutable message) {
         try {
-            return extension.rcv(this, message);
+            Promise.Completable<ServerMessage.Mutable> c = new Promise.Completable<>();
+            extension.outgoing(this, message, c);
+            return c;
         } catch (Throwable x) {
             _logger.info("Exception while invoking extension " + extension, x);
-            return true;
-        }
-    }
-
-    protected boolean extendSendMeta(ServerMessage.Mutable message) {
-        if (!message.isMeta()) {
-            throw new IllegalStateException();
-        }
-
-        for (Extension extension : _extensions) {
-            if (!notifySendMeta(extension, message)) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    private boolean notifySendMeta(Extension extension, ServerMessage.Mutable message) {
-        try {
-            return extension.sendMeta(this, message);
-        } catch (Throwable x) {
-            _logger.info("Exception while invoking extension " + extension, x);
-            return true;
-        }
-    }
-
-    protected ServerMessage.Mutable extendSendMessage(ServerMessage.Mutable message) {
-        if (message.isMeta()) {
-            throw new IllegalStateException();
-        }
-
-        for (Extension extension : _extensions) {
-            message = notifySend(extension, message);
-            if (message == null) {
-                return null;
-            }
-        }
-
-        return message;
-    }
-
-    private ServerMessage.Mutable notifySend(Extension extension, ServerMessage.Mutable message) {
-        try {
-            ServerMessage result = extension.send(this, message);
-            if (result instanceof ServerMessage.Mutable) {
-                return (ServerMessage.Mutable)result;
-            } else {
-                return result == null ? null : _bayeux.newMessage(result);
-            }
-        } catch (Throwable x) {
-            _logger.info("Exception while invoking extension " + extension, x);
-            return message;
+            return CompletableFuture.completedFuture(message);
         }
     }
 

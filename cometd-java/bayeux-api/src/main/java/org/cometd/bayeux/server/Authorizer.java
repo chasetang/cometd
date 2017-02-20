@@ -17,6 +17,7 @@ package org.cometd.bayeux.server;
 
 import org.cometd.bayeux.Channel;
 import org.cometd.bayeux.ChannelId;
+import org.cometd.bayeux.Promise;
 
 /**
  * <p>{@link Authorizer}s authorize {@link Operation operations} on {@link ServerChannel channels}.</p>
@@ -113,6 +114,10 @@ public interface Authorizer {
          * The operation to publish messages to a channel
          */
         PUBLISH
+    }
+
+    default void authorize(Operation operation, ChannelId channel, ServerSession session, ServerMessage message, Promise<Result> promise) {
+        promise.succeed(authorize(operation, channel, session, message));
     }
 
     /**
